@@ -1,9 +1,9 @@
 """今の締切カレンダー（job-commit.com）と企業名鑑（https://kigyo-meikan.jp/deadline）の
-締切データを統合して、LP用の締切カレンダーHTMLを生成する。
+締切データを統合して、LP用とサンクスページ用の締切カレンダーHTMLを生成する。
 
 使い方:
     py -3 update_deadline.py                 # output/ に生成
-    py -3 update_deadline.py --out パス       # 出力先を指定
+    py -3 update_deadline.py --out パス       # LP用の出力先を指定（サンクス用は同じフォルダ）
 
 ※ 企業名鑑 編集部の掲載許可に基づいて利用。出典表記は消さないこと。
 ※ 出力を EXISTING_URL と同じ場所に上書きしないこと（自分の出力を読み込んで二重に数えてしまうため）。
@@ -17,7 +17,8 @@ import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-EXISTING_URL = "https://job-commit.com/marketing/shukatsu-ichiba/internship_autumn_winter_prev.html"
+EXISTING_URL = "https://job-commit.com/marketing/shukatsu-ichiba/internship_autumn_winter.html"  # 全件版
+FULL_NAME = "internship_autumn_winter_full.html"  # サンクスページ用の出力ファイル名
 SOURCE_URL = "https://kigyo-meikan.jp/deadline"
 SOURCE_NAME = "企業名鑑"
 USER_AGENT = "Mozilla/5.0 (compatible; LP-deadline-updater/1.0)"
@@ -29,6 +30,7 @@ TOP_COUNT = 5        # 通常表示する件数
 BLUR_COUNT = 3       # ぼかし表示する件数
 PREVIEW_COUNT = 150  # 登録ボタン下のプレビュー表の件数
 URGENT_DAYS = 3      # 「締切まであとN日以内」の基準
+MAX_DAYS = 300       # これより先の締切は、過ぎた日付が来年扱いされたものとみなして載せない
 MIN_MEIKAN = 100     # 企業名鑑の取得件数がこれ未満なら失敗とみなす
 MIN_EXISTING = 10    # 既存データの取得件数がこれ未満なら失敗とみなす
 
@@ -70,9 +72,9 @@ def fetch_meikan():
 
 
 def fetch_existing():
-    """既存HTMLから行データと総件数を読む。行は全件ではなく先頭の一部だけ入っている。"""
+    """既存の全件版HTMLから行データを読む"""
     page = get(EXISTING_URL)
-    m = re.search(r"（(\d{4})年(\d{1,2})月(\d{1,2})日更新）", page)
+    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日更新", page)
     base = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))  # data-days の基準日
 
     row_re = re.compile(
@@ -87,13 +89,8 @@ def fetch_existing():
             "iso": (base + timedelta(days=int(days))).isoformat(),
             "industry": html.unescape(ind),
         }
-        records[(rec["company"], rec["text"], rec["iso"])] = rec  # 上の表とプレビュー表の重複を除去
-
-    # 総件数 = 通常表示の行数 + 「※この他にN件」
-    top_rows = len(re.findall(r"<tr data-industry", page.split('class="blur-teaser"')[0]))
-    other = re.search(r"この他に(\d+)件", page)
-    total = top_rows + int(other.group(1)) if other else len(records)
-    return list(records.values()), total
+        records[(rec["company"], rec["text"], rec["iso"])] = rec  # 完全に同じ行の重複を除去
+    return list(records.values())
 
 
 def norm(name: str) -> str:
@@ -103,15 +100,14 @@ def norm(name: str) -> str:
     return re.sub(r"[\s　]", "", name).lower()
 
 
-def merge(existing, existing_total, meikan, today: date):
+def merge(existing, meikan, today: date):
     seen = {(norm(r["company"]), r["iso"]) for r in existing}
     added = [r for r in meikan if (norm(r["company"]), r["iso"]) not in seen]
-    rows = sorted((r for r in existing + added if r["iso"] >= today.isoformat()),
+    # 締切を過ぎたものと、MAX_DAYSより先のもの（過ぎた日付が来年扱いされたもの）は載せない
+    first, last = today.isoformat(), (today + timedelta(days=MAX_DAYS)).isoformat()
+    rows = sorted((r for r in existing + added if first <= r["iso"] <= last),
                   key=lambda r: (r["iso"], r["company"]))
-    # 既存データのうち行が入っていない分は判定できないので、件数は既存総数＋企業名鑑の追加分
-    added_upcoming = sum(1 for r in added if r["iso"] >= today.isoformat())
-    total = max(existing_total + added_upcoming, len(rows))
-    return rows, total, added_upcoming
+    return rows, len(added)
 
 
 def date_text(d: date) -> str:
@@ -186,13 +182,24 @@ def build_html(rows, total, today: date) -> str:
     return "".join(parts)
 
 
+def build_full_html(rows, today: date) -> str:
+    """サンクスページ用：全件を1つの表で表示"""
+    updated = f"{today.year}年{today.month}月{today.day}日"
+    return ('<table>\n        '
+            f'<caption style="{CAPTION_STYLE}">秋冬インターン締切一覧｜{updated}更新・{len(rows)}件（締切日順）</caption>'
+            f'{thead()}\n        <tbody>' + "".join(row(r, today) for r in rows) + '</tbody>\n    </table>'
+            f'\n    <p style="text-align:right;margin-top:8px;font-size:10px;color:#888;">'
+            f'出典の一部：<a href="{SOURCE_URL}" target="_blank" rel="noopener">{SOURCE_NAME}</a>（{updated}取得）</p>')
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default=str(Path(__file__).parent / "output" / "internship_autumn_winter_merged.html"))
+    parser.add_argument("--out", default=str(Path(__file__).parent / "output" / "internship_autumn_winter_merged.html"),
+                        help="LP用の出力先。サンクスページ用の全件版は同じフォルダに FULL_NAME で出力する")
     args = parser.parse_args()
 
     # どちらかの取得に失敗したら、古いファイルを壊さないよう出力せずに中止する
-    existing, existing_total = fetch_existing()
+    existing = fetch_existing()
     if len(existing) < MIN_EXISTING:
         sys.exit(f"既存データの取得件数が少なすぎます（{len(existing)}件）。中止しました。")
     meikan = fetch_meikan()
@@ -200,13 +207,15 @@ def main():
         sys.exit(f"企業名鑑の取得件数が少なすぎます（{len(meikan)}件）。サイトの構造が変わった可能性があるため中止しました。")
 
     today = datetime.now(JST).date()
-    rows, total, added = merge(existing, existing_total, meikan, today)
+    rows, added = merge(existing, meikan, today)
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(build_html(rows, total, today), encoding="utf-8")
-    print(f"既存 {len(existing)}行（総数 {existing_total}件） + 企業名鑑の追加 {added}件"
-          f" → 表示行 {len(rows)}件 / 総数 {total}件 → {out}")
+    out.write_text(build_html(rows, len(rows), today), encoding="utf-8")
+    full = out.parent / FULL_NAME
+    full.write_text(build_full_html(rows, today), encoding="utf-8")
+    print(f"既存 {len(existing)}件 + 企業名鑑の追加 {added}件 → 掲載 {len(rows)}件（過去・{MAX_DAYS}日超を除外）\n"
+          f"  LP用: {out}\n  サンクス用: {full}")
 
 
 if __name__ == "__main__":
