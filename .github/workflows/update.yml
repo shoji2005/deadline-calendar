@@ -1,0 +1,50 @@
+name: 締切カレンダー更新
+
+on:
+  schedule:
+    # 日本時間 0:30 と 9:00（GitHubの都合で数十分遅れることがある）
+    - cron: "30 15 * * *"
+    - cron: "0 0 * * *"
+  workflow_dispatch: # Actions画面から手動実行もできる
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 取得に失敗した場合はここで止まり、公開中のファイルは前回のまま残る
+      - name: HTMLを生成
+        run: python update_deadline.py --out public/internship_autumn_winter_merged.html
+
+      # 毎日コミットしておくと、60日間更新が無いと定期実行が止まるGitHubの仕様を避けられる
+      - name: 生成結果をコミット
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add public
+          git diff --cached --quiet || git commit -m "締切カレンダー更新 $(TZ=Asia/Tokyo date +%F)"
+          git push
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - id: deploy
+        uses: actions/deploy-pages@v4
